@@ -1,0 +1,46 @@
+#version: '3.8'
+services:
+  # 1. DATABASE MYSQL
+  db:
+    image: mysql:8.0
+    platform: linux/amd64  # Add this line
+    container_name: finance_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: 123qwe
+      MYSQL_DATABASE: finance_db
+    ports:
+      - "0.0.0.0:3307:3306" # Kita pakai port 3307 di laptop agar tidak bentrok jika Anda punya MySQL lain
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin" ,"ping", "-h", "localhost"]
+      timeout: 20s
+      retries: 10
+
+  # 2. BACKEND (GOLANG)
+  backend:
+    build: ./backend
+    platform: linux/amd64  # Add this line
+    container_name: finance_backend
+    ports:
+      - "0.0.0.0:8081:8081"
+    environment:
+      - DB_HOST=db       # <--- PENTING: Harus 'db', bukan localhost/127.0.0.1
+      - DB_USER=root
+      - DB_PASSWORD=123qwe
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 3. FRONTEND (REACT + NGINX)
+  frontend:
+    build: ./frontend
+    platform: linux/amd64  # Add this line
+    container_name: finance_frontend
+    ports:
+      - "0.0.0.0:5173:80" # Akses di browser tetap localhost:5173
+    depends_on:
+      - backend
+
+volumes:
+  mysql_data:
