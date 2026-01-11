@@ -1,0 +1,177 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"golang.org/x/crypto/bcrypt"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+)
+
+// --- MODEL DATABASE ---
+
+type User struct {
+	ID       uint   `gorm:"primaryKey" json:"id"`
+	Username string `gorm:"unique" json:"username"`
+	Password string `json:"password"`
+}
+
+type Transaction struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	UserID          uint      `json:"user_id"`
+	Title           string    `json:"title"`
+	Amount          float64   `json:"amount"`
+	Type            string    `json:"type"`
+	Category        string    `json:"category"`
+	TransactionDate string    `json:"date" gorm:"column:tgl_transaksi"`
+	CreatedAt       time.Time `json:"created_at"`
+}
+
+var db *gorm.DB
+
+func connectDatabase() {
+	// Ambil konfigurasi dari Environment Variable (diset di Docker nanti)
+	// Jika tidak ada (sedang run lokal), pakai default.
+	dbUser := os.Getenv("DB_USER")
+	if dbUser == "" { dbUser = "root" }
+	
+	dbPass := os.Getenv("DB_PASSWORD")
+	// Password default kosong buat lokal, tapi di docker nanti kita isi
+	
+	dbHost := os.Getenv("DB_HOST")
+	if dbHost == "" { dbHost = "127.0.0.1" }
+
+	dbName := "finance_db"
+
+	// Format DSN baru
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?charset=utf8mb4&parseTime=True&loc=Local", dbUser, dbPass, dbHost, dbName)
+	
+	database, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic("Gagal koneksi ke database: " + err.Error())
+	}
+	database.AutoMigrate(&User{}, &Transaction{})
+	db = database
+}
+
+func connectDatabase() {
+	dsn := "root:123qwe@tcp(127.0.0.1:3306)/finance_db?charset=utf8mb4&parseTime=True&loc=Local"
+	database, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	if err != nil {
+		panic("Gagal koneksi ke database: " + err.Error())
+	}
+	// AutoMigrate akan otomatis menambah kolom user_id
+	database.AutoMigrate(&User{}, &Transaction{})
+	db = database
+}
+
+// --- HANDLERS ---
+
+func register(c *gin.Context) {
+	var input User
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal hash password"})
+		return
+	}
+	input.Password = string(hashedPassword)
+	if err := db.Create(&input).Error; err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username sudah ada"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Registrasi berhasil"})
+}
+
+func login(c *gin.Context) {
+	var input User
+	var user User
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := db.Where("username = ?", input.Username).First(&user).Error; err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "User tidak ditemukan"})
+		return
+	}
+	// Perbaikan sintaks if err; err != nil
+	if err := bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(input.Password)); err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Password salah"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Login berhasil", "user_id": user.ID, "username": user.Username})
+}
+
+// --- UPDATE DI SINI: TRANSAKSI PER USER ---
+
+func getTransactions(c *gin.Context) {
+	// Ambil User ID dari parameter URL
+	userID := c.Query("user_id")
+	month := c.Query("month")
+	year := c.Query("year")
+
+	var transactions []Transaction
+
+	// Filter Wajib: Hanya ambil data milik user ini
+	query := db.Where("user_id = ?", userID).Order("tgl_transaksi desc")
+
+	// Filter Opsional: Bulan & Tahun
+	if month != "" && year != "" {
+		query = query.Where("tgl_transaksi LIKE ?", year+"-"+month+"-%")
+	}
+
+	query.Find(&transactions)
+	c.JSON(http.StatusOK, transactions)
+}
+
+func createTransaction(c *gin.Context) {
+	var input Transaction
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	// Input JSON dari frontend sudah mengandung "user_id"
+	db.Create(&input)
+	c.JSON(http.StatusOK, input)
+}
+
+func deleteTransaction(c *gin.Context) {
+	id := c.Param("id")
+	// Di aplikasi real, sebaiknya cek dulu apakah ID ini milik user yg login
+	if err := db.Delete(&Transaction{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Gagal"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "Terhapus"})
+}
+
+func main() {
+	connectDatabase()
+	r := gin.Default()
+
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:5173"},
+		AllowMethods:     []string{"GET", "POST", "DELETE"},
+		AllowHeaders:     []string{"Origin", "Content-Type"},
+		AllowCredentials: true,
+	}))
+
+	api := r.Group("/api")
+	{
+		api.POST("/register", register)
+		api.POST("/login", login)
+		api.GET("/transactions", getTransactions)
+		api.POST("/transactions", createTransaction)
+		api.DELETE("/transactions/:id", deleteTransaction)
+	}
+
+	r.Run(":8081")
+}
